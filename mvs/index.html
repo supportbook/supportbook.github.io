@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang=en-US>
+<meta charset=utf-8>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MVS</title>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.8.0/sql-wasm.js" integrity="sha512-n7swEtVCvXpQ7KxgpPyp0+DQQEf5vPpmzCRl14x2sp2v5LpCYCjrAx03mkBAbWwGF9eUoIk8YVcDFuJRIeYttg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.0.4/pako.min.js"></script>
+
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/water.css@2/out/light.css">
+
+<style>
+body {
+    max-width: 80%;
+}
+table {
+    table-layout: auto;
+}
+.table-container {
+    overflow-x: scroll;
+}
+input[type=search] {
+    width: 100%;
+}
+/* make filenames monospace */
+.mono {
+    font-family: monospace;
+    white-space: nowrap;
+}
+tr > td {
+    vertical-align: middle;
+}
+tr > td > input {
+    margin: revert;
+}
+#loading {
+  animation: ps 2s linear infinite;
+}
+@keyframes ps {
+  50% {
+    opacity: 20%;
+  }
+}
+</style>
+
+<header>
+    <h1>
+        MVS dump
+    </h1>
+    <hr>
+</header>
+<main>
+    <h2>How to use?</h2>
+    <ol>
+        <li>Type in your query in <b>Search Products</b>.
+        <li>Click <b>Browse Files</b> to search through the files of all <b>selected products</b>.
+    </ol>
+
+    <h2>Example:</h2>
+    <ol>
+        <li> Type <kbd>Windows 11 21h2 business March 2023</kbd> into the search bar.
+        <li> Open the <b>Browse Files</b> section and type in <kbd>en-us x64</kbd>
+    </ol>
+    <hr>
+    <h1 id=loading>Loading database.. Please wait..</h1>
+    <!-- display:none until the DB is downloaded.. -->
+    <details open style=display:none>
+        <summary>
+            1. Select Products
+        </summary>
+        <form id=product-form onsubmit="return false">
+            <label for=searchbar-p>Search keywords:</label>
+            <input id=searchbar-p type="search">
+        </form>
+        <table id=products>
+            <thead>
+                <tr>
+                    <th>&checkmark;</th>
+                    <th>ID
+                    <th>Product Name
+            </thead>
+            <tbody>
+            </tbody>
+        </table>
+    </details>
+    <details style=display:none>
+        <summary>
+            2. Browse Files
+        </summary>
+        <form id=file-form onsubmit="return false">
+            <label for=searchbar-f>Search keywords:</label>
+            <input id=searchbar-f type=search>
+        </form>
+        <div class=table-container>
+            <table id=files>
+                <thead>
+                    <tr>
+                        <th>Product ID
+                        <th>File name
+                        <th>SHA1
+                        <th>SHA256
+                </thead>
+                <tbody></tbody>
+            </table>
+        </div>
+    </details>
+    <details style=display:none>
+        <summary>3. Generate summary files</summary>
+        <form id=generator-form>
+
+            <p>This allows you to generate a checksum file for <b>selected products</b>.</p>
+
+            <fieldset>
+                <legend>Choose preset summary:</legend>
+                <input id=gen-rad-1 type=radio name=preset value=sha2>
+                <label for=gen-rad-1>SHA256 file (for <code>sha256sum</code> or similar)</label><br>
+
+                <input id=gen-rad-2 type=radio name=preset value=sha1>
+                <label for=gen-rad-2>SHA128 file (for <code>sha1sum</code> or similar)</label><br>
+
+                <input id=gen-rad-3 type=radio name=preset value=sha checked>
+                <label for="gen-rad-3">Mixed SHA checksum file (sha2 OR sha1 for each file, sha2 preferred)</label><br>
+
+                <input type=submit id=generator-submit value=Generate>
+            </fieldset>
+        </form>
+    </details>
+
+    <hr>
+    <blockquote>
+        This does not infringe on anyone's copyright.<br>
+        Information stored and displayed here does not constitute copyrighted material - only describes it.<br>
+        No one earns any money from this. Additionally, it does not conflict with even a single word of the Visual Studio EULA.<br>
+        <footer><cite>Disclaimer</cite></footer>
+    </blockquote>
+
+</main>
+<footer>
+    Made for <b>the Glory of Cthulhu</b>
+</footer>
+
+<script>
+    // {{{ Helper functions
+    $  = s => document.querySelector(s);
+    $a = s => document.querySelectorAll(s);
+    n$ = e => document.createElement(e);
+
+    get_selected_product_ids = () => Array.from(document.querySelectorAll('input[type=checkbox]:checked')).reduce(
+        (a, x) => {
+            a.push(x.id);
+            return a;
+        },
+        []
+    );
+
+    function build_product_query(search_string) {
+        // Regex search
+        if (search_string.match(/\/.*\//))
+            return 'SELECT id, name FROM products WHERE regexp(name, "' + search_string.slice(1, -1) + '") is not null;'
+
+        // Splits by spaces (for non-exact matches)
+        // Replaces '+' with ' ' to force exact matches
+        return search_string.split(' ').reduce(
+            (a, x) => a + ' AND name LIKE "%' + x.replaceAll('+', ' ') + '%"',
+            'SELECT id, name FROM products WHERE 1'
+        ) + ' ORDER BY id DESC;';
+    }
+
+    // fields: product, name, sha1, sha2
+    build_file_query = (search_string, fields, products) => search_string.split(' ').reduce(
+        (a, x) => a + ' AND name LIKE "%' + x + '%"',
+        'SELECT ' + fields.join() + ' FROM files WHERE product IN (' + products.join() + ') AND ((sha1 IS NOT NULL) OR (sha2 IS NOT NULL))'
+    ) + ' ORDER BY product DESC, name ASC;';
+
+    download = (name, content) => {
+        let e = n$('a');
+        e.setAttribute('href', 'data:text/plain;charset=utf-8,' + encodeURIComponent(content));
+        e.setAttribute('download', name);
+        e.style.display = 'none';
+        document.body.appendChild(e);
+        e.click();
+        document.body.removeChild(e);
+    }
+
+    // Helper functions }}}
+</script>
+
+<script>
+
+// Initialize DB engine
+const xhr = new XMLHttpRequest();
+xhr.open('GET', 'mvs.sqlite.gz', true);
+xhr.responseType = 'arraybuffer';
+
+initSqlJs({
+    locateFile: file => "https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.8.0/" + file
+}).then(function(SQL){
+    xhr.onload = (e) => {
+
+        $('#loading').remove()
+        $a('details').forEach(e=>e.style='')
+
+        const uInt8Array = pako.ungzip(xhr.response);
+        db = new SQL.Database(uInt8Array);
+        db.create_function('regexp', (str, exp) => str.match(exp));
+
+        // register handler for summary generation
+        $('#generator-form').addEventListener('submit', (e) => {
+            if(e.preventDefault) e.preventDefault();
+
+            let fmt = $('#generator-form > fieldset > input[type=radio]:checked').value
+
+            console.log(fmt, 'fmt')
+
+            let prods = db.exec('SELECT id, name FROM products WHERE id IN (' + get_selected_product_ids().join() + ') ORDER BY id ASC;' );
+            out = ''
+
+            for (const p_row of prods[0].values) {
+                out += '# ' + p_row[1] + ' [' + p_row[0] + ']\n';
+
+                let fields = ['name'];
+                if(fmt == 'sha'){
+                    fields.push('sha1');
+                    fields.push('sha2');
+                } else fields.push(fmt);
+
+                let files = db.exec(build_file_query('', fields, [p_row[0]]));
+                if(files[0] === undefined)
+                    continue;
+                for (const f_row of files[0].values) {
+                    if (fmt == 'sha') {
+                        if(!f_row[2]) { // no sha2
+                            if(f_row[1])
+                                out += f_row[1].toLowerCase() + ' *' + f_row[0] + '\n';
+                            else
+                                continue
+                        } else
+                            out += f_row[2].toLowerCase() + ' *' + f_row[0] + '\n';
+                    } else {
+                        if(!f_row[1])
+                            continue; // likely nothing else in the product will have it, but it's still microsoft
+                        out += f_row[1].toLowerCase() + ' *' + f_row[0] + '\n';
+                    }
+                }
+                out += '\n';
+            }
+            download('products.' + fmt, out);
+
+            return false;
+        });
+
+        // Update product list on updated search terms
+        // onkeypress is used instead of onchange or onsearch
+        // because onchange will not trigger on no change or
+        // when the searchbar state is preserved betwen refreshes
+        // and onsearch is not supported on most browsers.
+
+        $('#searchbar-p').addEventListener('keypress', (e) => {
+
+            if(!e.code.endsWith('Enter'))
+                return;
+
+            let products = db.exec(build_product_query(e.target.value));
+            // [Thank you committee geniuses for the lack of a parent selector in CSS]
+            for (const x of $a('#products input:not(:checked)')) {
+                x.parentElement.parentElement.remove();
+            }
+
+            // Construct a rows fragment and append it the product list
+            $('#products>tbody').appendChild(products[0].values.reduce(
+                (a, x) => {
+                    let row = n$('tr');
+                    let checkbox = n$('input');
+                    checkbox.id = x[0];
+                    checkbox.setAttribute('type', 'checkbox');
+
+                    let checkbox_td = n$('td'); checkbox_td.appendChild(checkbox);
+                    row.appendChild(checkbox_td);
+
+                    for (const field of x) {
+                        let tdata = n$('td');
+                        tdata.textContent = field;
+                        row.appendChild(tdata);
+                    }
+                    a.appendChild(row);
+                    return a;
+                },
+                document.createDocumentFragment()
+            ));
+
+            // Update the file list for products
+
+            let file_list = $('#files>tbody');
+            file_list.innerHTML = '';
+
+            // Set the file searchbar listener
+            $('#searchbar-f').addEventListener('keypress', (e) => {
+
+                if(!e.code.endsWith('Enter'))
+                    return;
+                // Do not update search results if the Browse Files prompt is closed
+                if(!e.target.parentElement.parentElement.open)
+                    return;
+                file_list.innerHTML = '';
+
+                let files = db.exec(build_file_query(e.target.value, ['product', 'name', 'sha1', 'sha2'], get_selected_product_ids()));
+
+                part = document.createDocumentFragment();
+                for (const row of files[0].values) {
+                    let r = n$('tr');
+
+                    for (const x of row) {
+                        let d = n$('td');
+                        d.textContent = x;
+                        d.classList.add('mono');
+                        r.appendChild(d);
+                    }
+                    part.appendChild(r);
+                }
+                file_list.appendChild(part);
+            })
+        });
+    };
+    xhr.send();
+});
+</script>
